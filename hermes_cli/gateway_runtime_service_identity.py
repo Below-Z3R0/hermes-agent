@@ -175,16 +175,45 @@ def manager_environment_pairs(value: str) -> dict[str, str]:
 
     One ``KEY=VALUE`` per line: a different grammar from the space-separated
     ``Environment=`` property that :func:`environment_pairs` reads, so the two
-    readers stay apart. A value systemd needs to quote prints as ``$'...'``;
-    inside, only ``\\``, ``\'`` and control or invalid-UTF-8 bytes (``\t``,
-    ``\ooo``) are escaped and UTF-8 stays raw, so the decode is byte-level and
-    returns ``os.fsdecode`` values the way ``os.environ`` does. Anything outside
-    that grammar is refused rather than guessed at.
+    readers stay apart.
+
+    Two dialects reach us. From v234 the value systemd needs to quote prints as
+    ``$'...'``; inside, only ``\\``, ``\'`` and control or invalid-UTF-8 bytes
+    (``\t``, ``\ooo``) are escaped and UTF-8 stays raw, so the decode is
+    byte-level and returns ``os.fsdecode`` values the way ``os.environ`` does.
+    Up to v233 the block was written with ``puts()`` and carries no escaping at
+    all, so a backslash or a quote there is a literal character rather than the
+    start of an escape.
+
+    The quoting dialect is tried first, and a dump is only re-read as the raw
+    dialect when it holds no ``$'`` value at all. That ordering is what keeps
+    the two apart without guessing: from v234 every value containing a
+    backslash, a quote, whitespace or another shell character is quoted, so an
+    unquoted one cannot come from a quoting host.
 
     Split on ``\n`` only: ``str.splitlines`` also breaks on ``\x0b``, ``\x0c``,
     ``\x1c``-``\x1e``, ``\x85``, ``\u2028`` and ``\u2029``, which systemd
     emits raw inside a value and which would otherwise cut a pair in half.
     """
+    try:
+        return _manager_environment_pairs_quoted(value)
+    except ValueError:
+        if _has_quoted_value(value):
+            raise
+    return _manager_environment_pairs_raw(value)
+
+
+def _has_quoted_value(value: str) -> bool:
+    """Whether any assignment in *value* carries an ANSI-C quoted value."""
+    for line in value.split("\n"):
+        _, separator, val = line.partition("=")
+        if separator and val.startswith("$'"):
+            return True
+    return False
+
+
+def _manager_environment_pairs_quoted(value: str) -> dict[str, str]:
+    """Read the v234+ dialect, where anything ambiguous is wrapped in ``$'...'``."""
     result = {}
     for line in value.split("\n"):
         if not line:
@@ -206,6 +235,34 @@ def manager_environment_pairs(value: str) -> dict[str, str]:
         elif "\\" in val or "'" in val:
             _unverified()
         result[key] = val
+    return result
+
+
+def _manager_environment_pairs_raw(value: str) -> dict[str, str]:
+    """Read the up-to-v233 dialect, where ``puts()`` wrote the value verbatim.
+
+    Nothing is escaped, so a backslash and a quote are ordinary characters. The
+    one thing that format cannot say outright is a newline inside a value: it
+    was written as a line break, and the following line has no ``KEY=`` to open
+    a pair. Since every real assignment does have one, a line without ``=`` can
+    only continue the value above it, so it is appended back with the newline
+    the writer replaced.
+    """
+    result = {}
+    last = None
+    for line in value.split("\n"):
+        if not line:
+            continue
+        key, separator, val = line.partition("=")
+        if separator:
+            if not key or not _ENV_NAME.fullmatch(key):
+                _unverified()
+            result[key] = val
+            last = key
+        elif last is None:
+            _unverified()
+        else:
+            result[last] += "\n" + line
     return result
 
 

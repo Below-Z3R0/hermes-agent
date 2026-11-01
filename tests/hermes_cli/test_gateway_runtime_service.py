@@ -672,11 +672,11 @@ def test_manager_environment_pairs_decodes_show_environment(dump, expected):
 
 
 @pytest.mark.parametrize("dump", [
-    # Stray backslash outside any ``$'...'`` wrapper means the source is not our install.
-    "FOO=bar\\baz",
-    # A bare single quote never reaches us unquoted: systemd would wrap it.
-    "FOO='hello world'",
-    # Line without ``=`` cannot express a KEY=VAL pair.
+    # A quoted value means this is the v234+ dialect, so an unquoted backslash
+    # elsewhere cannot come from the manager and the dump is refused.
+    "OK=$'x y'\nFOO=bar\\baz",
+    "OK=$'x y'\nFOO='hello world'",
+    # A first line without ``=`` has no value to continue.
     "FOOBAR",
     # ``$'`` opened but never closed is malformed systemd output.
     "FOO=$'unterminated",
@@ -899,21 +899,48 @@ def test_manager_environment_pairs_reads_unquoted_values_verbatim():
     assert pairs == {"HOME": "/home/u", "PATH": "/usr/bin:/bin", "LANG": "café", "EMPTY": ""}
 
 
-@pytest.mark.parametrize("dump", [
-    # v233 is lossy: with no quoting there is no way to tell a literal
-    # backslash from an escape, so the line is refused instead of guessed at.
-    "Z=a\\b",
-    # Same for a bare quote: v234+ always wraps one in $'...'.
-    "Z=a'b",
-    # A raw newline cuts the pair in half; the fragment has no "=" and is refused.
-    "Z=a\nb",
+@pytest.mark.parametrize("dump,expected", [
+    # Up to v233 the block was written with puts(), so a backslash and a quote
+    # are ordinary characters rather than escapes.
+    ("FOO=bar\\baz", {"FOO": "bar\\baz"}),
+    ("FOO='hello world'", {"FOO": "'hello world'"}),
+    ("MANPAGER=sh -c 'col -bx | bat -l man -p'",
+     {"MANPAGER": "sh -c 'col -bx | bat -l man -p'"}),
+    # Control bytes are literal too: nothing in that format escapes them.
+    ("FOO=a\x01b", {"FOO": "a\x01b"}),
+    ("FOO=a\x7fb", {"FOO": "a\x7fb"}),
+    # The one thing puts() cannot say outright is a newline inside a value: it
+    # was written as a line break. Every real assignment opens with KEY=, so a
+    # line without one continues the value above.
+    ("FOO=a\nb", {"FOO": "a\nb"}),
+    ("A=x\ny z\nB=2", {"A": "x\ny z", "B": "2"}),
 ])
-def test_manager_environment_pairs_refuses_the_lossy_v233_shape(dump):
-    """The pre-v234 format cannot represent these values, so they fail closed.
+def test_manager_environment_pairs_reads_the_pre_v234_raw_dialect(dump, expected):
+    """The pre-v234 dialect carries no escaping, so its bytes are taken verbatim.
 
-    No distribution that ships ``show-environment`` (v233, Nov 2017) still
-    matters, but refusing rather than guessing keeps a corrupted dump from
-    being read as an identity proof.
+    ``show-environment`` used ``puts()`` until v234, which means a value came
+    out exactly as it went in. Refusing a backslash there would be wrong: it is
+    a real character, not the start of an escape. The quoted dialect is still
+    tried first, and the dump is only re-read raw when it holds no ``$'`` value,
+    so a quoting host can never be mistaken for this one.
+    """
+    from hermes_cli.gateway_runtime_service_identity import manager_environment_pairs
+    assert manager_environment_pairs(dump) == expected
+
+
+@pytest.mark.parametrize("dump", [
+    # A quoting host would never emit an unquoted backslash, but a dump holding
+    # $' values is a quoting host, so the raw re-read is off the table.
+    "A=$'x y'\nB=raw\\backslash",
+    "A=$'x y'\nB=bad'quote",
+    "A=$'x y'\nNOEQUALS",
+])
+def test_manager_environment_pairs_keeps_the_raw_reread_off_a_quoting_dump(dump):
+    r"""A dump with any ``$'`` value is a quoting host, so it fails closed.
+
+    Without this the raw dialect's ``\`` acceptance would also swallow a
+    malformed quoting dump, where an unquoted backslash means the text was not
+    produced by systemd.
     """
     from hermes_cli.gateway_runtime_service_identity import manager_environment_pairs
     with pytest.raises(ValueError, match="service_identity_unverified"):
