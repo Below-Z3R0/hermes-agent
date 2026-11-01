@@ -852,3 +852,69 @@ def test_manager_environment_pairs_end_to_end_against_systemd_quoted_dump():
     assert pairs["LANG"] == "en\n"
     assert pairs["DOCS"] == "/home/José/Documents"
     assert pairs["PATH"].startswith("/usr/local/bin")
+
+
+# Every escape generation ``systemctl show-environment`` has ever printed.
+#
+# ``shell_maybe_quote()`` changed twice, and both older forms still reach users
+# on LTS hosts: Debian 10/11, Ubuntu 18.04-22.04, RHEL 8 and openSUSE 15 all
+# predate v250, where the JSON form the JSON reader needs was introduced.
+#
+#   v233      ``puts()`` of the raw value: no quoting at all.
+#   v234-248  ``$'...'`` escaping only ``\\``, ``\'``, ``\n`` and ``\t``; every other
+#             control byte is written raw inside the quotes.
+#   v249+     ``$'...'`` routing control bytes through ``cescape_char()``, which
+#             emits ``\a \b \f \n \r \t \v`` and ``\ooo`` octal for the rest.
+#
+# The three forms below are the same value in each generation's dialect, so a
+# single reader has to land on the same result for all of them.
+@pytest.mark.parametrize("generation,escaped", [
+    # v234-248: the vertical tab is raw inside the quotes, only \t is escaped.
+    ("v234", "$'a\x0bb\\tc'"),
+    # v249+: the vertical tab goes through cescape_char as \v.
+    ("v249", "$'a\\vb\\tc'"),
+    # Octal is how v249+ writes control bytes with no short escape.
+    ("v249-octal", "$'a\\013b\\011c'"),
+])
+def test_manager_environment_pairs_reads_every_escape_generation(generation, escaped):
+    """Each historical escape dialect decodes to the same value.
+
+    A reader that only understands the current generation would either raise
+    (failing the gateway closed on an LTS host) or, worse, keep the escape
+    text as part of the value and compare against the wrong ``HERMES_HOME``.
+    """
+    from hermes_cli.gateway_runtime_service_identity import manager_environment_pairs
+    assert manager_environment_pairs(f"Z={escaped}")["Z"] == "a\x0bb\tc", generation
+
+
+def test_manager_environment_pairs_reads_unquoted_values_verbatim():
+    """v233 printed values raw; a plain value with no quoting decision round-trips.
+
+    v233's ``show-environment`` wrote the block with ``puts()``, so anything
+    that did not need quotes arrived unescaped. Such a value has to be taken
+    literally rather than rejected.
+    """
+    from hermes_cli.gateway_runtime_service_identity import manager_environment_pairs
+    pairs = manager_environment_pairs("HOME=/home/u\nPATH=/usr/bin:/bin\nLANG=café\nEMPTY=\n")
+    assert pairs == {"HOME": "/home/u", "PATH": "/usr/bin:/bin", "LANG": "café", "EMPTY": ""}
+
+
+@pytest.mark.parametrize("dump", [
+    # v233 is lossy: with no quoting there is no way to tell a literal
+    # backslash from an escape, so the line is refused instead of guessed at.
+    "Z=a\\b",
+    # Same for a bare quote: v234+ always wraps one in $'...'.
+    "Z=a'b",
+    # A raw newline cuts the pair in half; the fragment has no "=" and is refused.
+    "Z=a\nb",
+])
+def test_manager_environment_pairs_refuses_the_lossy_v233_shape(dump):
+    """The pre-v234 format cannot represent these values, so they fail closed.
+
+    No distribution that ships ``show-environment`` (v233, Nov 2017) still
+    matters, but refusing rather than guessing keeps a corrupted dump from
+    being read as an identity proof.
+    """
+    from hermes_cli.gateway_runtime_service_identity import manager_environment_pairs
+    with pytest.raises(ValueError, match="service_identity_unverified"):
+        manager_environment_pairs(dump)
