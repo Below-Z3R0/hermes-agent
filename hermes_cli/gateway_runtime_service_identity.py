@@ -154,8 +154,10 @@ def subprocess_command(argv: list[str]) -> str:
 
 
 # systemd's shell_maybe_quote(SHELL_ESCAPE_POSIX): a value that needs quoting
-# prints as $'...' with \\ and \' escaped and control or invalid UTF-8 bytes as
-# C escapes (\t, \ooo); UTF-8 stays raw. Octal escapes are \ooo (up to \377).
+# prints as $'...', with \\ and ' escaped. v249+ writes every other control
+# byte as a C escape (\a \b \f \n \r \t \v, else \ooo octal, up to \377);
+# v234-v248 escapes only \n and \t and leaves the rest raw, so both forms
+# reach the regex below. UTF-8 stays raw either way.
 _POSIX_QUOTED = re.compile(rb"\$'((?:[^\\']|\\(?:[abfnrtv\\']|[0-3][0-7]{2}))*)'")
 _C_ESCAPES = {
     b"a": b"\a", b"b": b"\b", b"f": b"\f", b"n": b"\n",
@@ -178,12 +180,13 @@ def manager_environment_pairs(value: str) -> dict[str, str]:
     readers stay apart.
 
     Two dialects reach us. From v234 the value systemd needs to quote prints as
-    ``$'...'``; inside, only ``\\``, ``\'`` and control or invalid-UTF-8 bytes
-    (``\t``, ``\ooo``) are escaped and UTF-8 stays raw, so the decode is
-    byte-level and returns ``os.fsdecode`` values the way ``os.environ`` does.
-    Up to v233 the block was written with ``puts()`` and carries no escaping at
-    all, so a backslash or a quote there is a literal character rather than the
-    start of an escape.
+    ``$'...'``, with ``\\`` and ``\'`` escaped. v249+ also writes every other
+    control byte as a C escape, ``\ooo`` octal where there is no short form;
+    v234-v248 escapes only ``\n`` and ``\t`` and leaves the rest raw. UTF-8
+    stays raw either way, so the decode is byte-level and returns ``os.fsdecode``
+    values the way ``os.environ`` does. Up to v233 the block was written with
+    ``puts()`` and carries no escaping at all, so a backslash or a quote there is
+    a literal character rather than the start of an escape.
 
     The quoting dialect is tried first, and a dump is only re-read as the raw
     dialect when it holds no ``$'`` value at all. That ordering is what keeps

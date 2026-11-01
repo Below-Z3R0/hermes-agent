@@ -114,7 +114,7 @@ def _manager_environment(command: tuple[str, ...] | list[str], deadline: float) 
     )
     result = _run([*command, "show-environment", "--output=json"], deadline)
     if result.returncode:
-        # The flag itself was rejected: fall back to the plain text form.
+        # A build that refuses the flag still has the plain text form.
         result = _run([*command, "show-environment"], deadline)
         if result.returncode:
             raise RuntimeStartError("service_identity_unverified")
